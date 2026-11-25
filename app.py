@@ -17,7 +17,7 @@ app = FastAPI(
     title="Facebook Transcript Extractor",
     description="Transcribe publicly accessible Facebook videos and Reels. No private-content or access-control bypass.",
     version="1.0.0",
-    servers=[{"url": os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")}],
+    servers=[{"url": os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "http://localhost:8000"}],
 )
 
 security = HTTPBearer(auto_error=False)
@@ -93,9 +93,7 @@ def extract_media(url: str, folder: str) -> tuple[Path, Path | None]:
         "writeautomaticsub": True,
         "subtitleslangs": ["all"],
         "subtitlesformat": "vtt/best",
-        "match_filter": yt_dlp.utils.match_filter_func(
-            f"duration <= {MAX_VIDEO_SECONDS}"
-        ),
+        "match_filter": yt_dlp.utils.match_filter_func(f"duration <= {MAX_VIDEO_SECONDS}"),
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -114,8 +112,7 @@ def extract_media(url: str, folder: str) -> tuple[Path, Path | None]:
     ]
     if not audio_candidates:
         raise HTTPException(status_code=422, detail="No accessible audio stream was found.")
-    audio = max(audio_candidates, key=lambda p: p.stat().st_size)
-    return audio, subtitles
+    return max(audio_candidates, key=lambda p: p.stat().st_size), subtitles
 
 
 def parse_vtt(path: Path) -> list[dict]:
@@ -134,7 +131,7 @@ def parse_vtt(path: Path) -> list[dict]:
         except ValueError:
             seconds = 0.0
         cue = re.sub(r"<[^>]+>", "", " ".join(lines[timing_index + 1:])).strip()
-        cue = re.sub(r"&amp;", "&", cue)
+        cue = cue.replace("&amp;", "&")
         if cue and (not segments or segments[-1]["text"] != cue):
             segments.append({"start": seconds, "end": seconds, "text": cue})
     return segments
@@ -154,14 +151,10 @@ def transcribe_url(raw_url: str, language: str | None = None) -> dict:
                     "segments": caption_segments,
                     "method": "facebook_captions",
                 }
-
         try:
             model = get_model()
             segments_iter, info = model.transcribe(
-                str(audio),
-                language=language,
-                vad_filter=True,
-                beam_size=5,
+                str(audio), language=language, vad_filter=True, beam_size=5
             )
             segments = [
                 {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
@@ -169,7 +162,6 @@ def transcribe_url(raw_url: str, language: str | None = None) -> dict:
             ]
         except Exception as exc:
             raise HTTPException(status_code=500, detail="Audio transcription failed. Check FFmpeg, model resources, and server logs.") from exc
-
         return {
             "source_url": url,
             "language": info.language,
@@ -184,12 +176,7 @@ def health():
     return {"status": "ok", "service": "facebook-transcript-extractor"}
 
 
-@app.post(
-    "/transcribe",
-    response_model=TranscriptResponse,
-    operation_id="transcribe_facebook_video",
-    summary="Transcribe a public Facebook video or Reel",
-)
+@app.post("/transcribe", response_model=TranscriptResponse, operation_id="transcribe_facebook_video", summary="Transcribe a public Facebook video or Reel")
 def transcribe(request: TranscribeRequest, _: bool = Depends(verify_api_key)):
     result = transcribe_url(str(request.facebook_url), request.language)
     if not request.timestamps:

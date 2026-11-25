@@ -1,14 +1,13 @@
 # Facebook Transcript Extractor
 
-A self-hostable service that turns **publicly accessible Facebook videos, Reels, and video posts** into readable transcripts. It exposes both a REST API (with an OpenAPI schema for Custom GPT Actions) and an MCP tool for compatible ChatGPT clients.
+A self-hostable service that turns **publicly accessible Facebook videos, Reels, and video posts** into readable transcripts. It exposes a REST API with an OpenAPI schema for Custom GPT Actions, plus an optional MCP server for compatible clients.
 
 ## What it does
 
 - Accepts Facebook video, Reel, and `fb.watch` URLs.
-- Downloads media only when it is publicly accessible to the server.
-- Uses available subtitles when present; otherwise transcribes audio with faster-whisper.
+- Uses available subtitles when present; otherwise transcribes accessible audio with faster-whisper.
 - Returns plain text and timestamped segments.
-- Offers REST/OpenAPI and MCP interfaces.
+- Exposes a REST API and optional MCP tool.
 
 ## Important limitations
 
@@ -16,7 +15,7 @@ This does not bypass Facebook login, privacy settings, access controls, DRM, or 
 
 ## Run locally
 
-Requirements: Python 3.11+, FFmpeg, and (for audio transcription) enough RAM/CPU for Whisper.
+Requirements: Python 3.11+, FFmpeg, and enough RAM/CPU for Whisper.
 
 ```bash
 python -m venv .venv
@@ -29,7 +28,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 OpenAPI docs: `http://localhost:8000/docs`  
 OpenAPI JSON: `http://localhost:8000/openapi.json`
 
-Set `API_KEY` before exposing the service publicly. Send it as `Authorization: Bearer YOUR_KEY`.
+Set a strong `API_KEY` before exposing the API publicly. Send it as `Authorization: Bearer YOUR_KEY`.
 
 ## Deploy with Docker
 
@@ -37,33 +36,35 @@ Set `API_KEY` before exposing the service publicly. Send it as `Authorization: B
 docker compose up --build
 ```
 
-The API listens on port 8000. Persistent model caching is stored in the `whisper-cache` volume.
+The REST API listens on port 8000. Whisper model files are cached in a Docker volume.
 
-## Connect to a Custom GPT
+## Connect to a Custom GPT (recommended ChatGPT route)
 
-1. Deploy this API to a public HTTPS host.
-2. Open the API's `/openapi.json` endpoint and download the schema.
-3. In the GPT editor, add an Action and import the OpenAPI schema.
-4. Configure API-key authentication using the same value as `API_KEY`.
-5. In the GPT instructions, tell it: "When a user provides a public Facebook video or Reel URL and asks for a transcript, call the `transcribe_facebook_video` operation. Return the transcript faithfully, preserving timestamps when requested. If extraction fails, explain the access limitation and do not invent transcript content."
+1. Deploy the REST API to a public HTTPS host.
+2. Set a strong `API_KEY` and set `PUBLIC_BASE_URL` to the deployed API URL. The Render template can use Render's external URL automatically.
+3. In the GPT editor, add an Action and import the deployed `/openapi.json` schema URL.
+4. Configure Action authentication as API Key, Bearer, using the same `API_KEY` value.
+5. Add these GPT instructions:
 
-The generated OpenAPI schema includes the endpoint and bearer security scheme.
+   > When a user provides a public Facebook video or Reel URL and asks for a transcript, call the `transcribe_facebook_video` operation. Return the transcript faithfully and preserve timestamps when requested. If extraction fails, explain the access limitation and never invent transcript content.
 
-## Connect through MCP
+The GPT can then be shared with other people using the GPT's sharing settings. The API host remains responsible for availability, compute costs, and rate limiting.
 
-Run the MCP server as a separate process against the same codebase:
+## Optional MCP server
+
+Run the MCP server separately:
 
 ```bash
 python mcp_server.py
 ```
 
-It exposes the `transcribe_facebook_video` tool over Streamable HTTP at `/mcp` on port 8001 by default. Configure the server URL in an MCP-compatible ChatGPT app/client. If `API_KEY` is set, pass it as a bearer token in the MCP client connection.
+It exposes the `transcribe_facebook_video` tool over Streamable HTTP on port 8001. The MCP process calls the REST API using the configured `API_KEY`.
+
+**Security note:** the sample MCP listener does not implement inbound client authentication. Do not expose port 8001 directly to the public internet. Put it behind an authentication gateway or use it only on a trusted network. The REST API itself enforces bearer authentication when `API_KEY` is configured.
 
 ## API
 
 `POST /transcribe`
-
-Request:
 
 ```json
 {
@@ -92,11 +93,12 @@ Health check: `GET /health`.
 ## Configuration
 
 - `API_KEY`: optional locally; strongly recommended in production.
-- `WHISPER_MODEL`: default `small`; use `tiny` for lower resource usage or `medium` for better accuracy with more resources.
+- `PUBLIC_BASE_URL`: public HTTPS URL used in the generated OpenAPI schema.
+- `WHISPER_MODEL`: default `small`; `tiny` uses fewer resources, `medium` may improve accuracy.
 - `WHISPER_DEVICE`: default `cpu`.
 - `WHISPER_COMPUTE_TYPE`: default `int8`.
 - `MAX_VIDEO_SECONDS`: default `3600`.
-- `MCP_HOST`, `MCP_PORT`: MCP listener, defaults `0.0.0.0` and `8001`.
+- `MCP_HOST`, `MCP_PORT`: optional MCP listener, defaults `0.0.0.0` and `8001`.
 
 ## License
 

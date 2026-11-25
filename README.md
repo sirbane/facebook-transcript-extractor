@@ -1,104 +1,94 @@
 # Facebook Transcript Extractor
 
-A self-hostable service that turns **publicly accessible Facebook videos, Reels, and video posts** into readable transcripts. It exposes a REST API with an OpenAPI schema for Custom GPT Actions, plus an optional MCP server for compatible clients.
+A public API that attempts to transcribe publicly accessible Facebook videos and Reels. The Cloudflare Worker uses Facebook page metadata to locate a public video stream, Cloudflare Media Transformations to extract audio, and Cloudflare Workers AI Whisper for transcription.
 
-## What it does
+It does not bypass Facebook login, privacy settings, DRM, or other access controls. It is best-effort: Facebook may change its page format or block automated requests, and some public links may not expose a usable media URL.
 
-- Accepts Facebook video, Reel, and `fb.watch` URLs.
-- Uses available subtitles when present; otherwise transcribes accessible audio with faster-whisper.
-- Returns plain text and timestamped segments.
-- Exposes a REST API and optional MCP tool.
+## Live Cloudflare service
 
-## Important limitations
+- Health: https://facebook-transcript-extractor.griffinobungah189.workers.dev/health
+- OpenAPI schema: https://facebook-transcript-extractor.griffinobungah189.workers.dev/openapi.json
+- Transcription endpoint: `POST https://facebook-transcript-extractor.griffinobungah189.workers.dev/transcribe`
 
-This does not bypass Facebook login, privacy settings, access controls, DRM, or geographic restrictions. The service cannot transcribe a post it cannot legitimately access. Use it only for content you own, have permission to process, or are otherwise authorized to use. Respect copyright and Facebook's terms. Do not submit private links, session cookies, or account credentials.
+The Worker is deployed with two bindings:
+- `AI`: Cloudflare Workers AI
+- `MEDIA`: Cloudflare Media Transformations
 
-## Run locally
+## Configure the API key
 
-Requirements: Python 3.11+, FFmpeg, and enough RAM/CPU for Whisper.
+The transcription endpoint is intentionally locked until an API key secret is configured.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn app:app --host 0.0.0.0 --port 8000
+1. Open the Cloudflare dashboard.
+2. Go to **Workers & Pages** and open `facebook-transcript-extractor`.
+3. Open **Settings → Variables and Secrets**.
+4. Add a secret named `API_KEY`.
+5. Generate a long random value and store it in a password manager. Do not commit it to GitHub.
+6. Use the same value as the Bearer API key in the ChatGPT Action configuration.
+
+The health and OpenAPI endpoints do not require authentication. The transcription endpoint requires:
+
+```http
+Authorization: Bearer YOUR_API_KEY
+Content-Type: application/json
 ```
 
-OpenAPI docs: `http://localhost:8000/docs`  
-OpenAPI JSON: `http://localhost:8000/openapi.json`
+## Request
 
-Set a strong `API_KEY` before exposing the API publicly. Send it as `Authorization: Bearer YOUR_KEY`.
-
-## Deploy with Docker
-
-```bash
-docker compose up --build
+```http
+POST /transcribe
 ```
-
-The REST API listens on port 8000. Whisper model files are cached in a Docker volume.
-
-## Connect to a Custom GPT (recommended ChatGPT route)
-
-1. Deploy the REST API to a public HTTPS host.
-2. Set a strong `API_KEY` and set `PUBLIC_BASE_URL` to the deployed API URL. The Render template can use Render's external URL automatically.
-3. In the GPT editor, add an Action and import the deployed `/openapi.json` schema URL.
-4. Configure Action authentication as API Key, Bearer, using the same `API_KEY` value.
-5. Add these GPT instructions:
-
-   > When a user provides a public Facebook video or Reel URL and asks for a transcript, call the `transcribe_facebook_video` operation. Return the transcript faithfully and preserve timestamps when requested. If extraction fails, explain the access limitation and never invent transcript content.
-
-The GPT can then be shared with other people using the GPT's sharing settings. The API host remains responsible for availability, compute costs, and rate limiting.
-
-## Optional MCP server
-
-Run the MCP server separately:
-
-```bash
-python mcp_server.py
-```
-
-It exposes the `transcribe_facebook_video` tool over Streamable HTTP on port 8001. The MCP process calls the REST API using the configured `API_KEY`.
-
-**Security note:** the sample MCP listener does not implement inbound client authentication. Do not expose port 8001 directly to the public internet. Put it behind an authentication gateway or use it only on a trusted network. The REST API itself enforces bearer authentication when `API_KEY` is configured.
-
-## API
-
-`POST /transcribe`
 
 ```json
 {
   "facebook_url": "https://www.facebook.com/reel/...",
-  "language": null,
-  "timestamps": true
+  "language": "en"
 }
 ```
 
-Response:
+The `language` field is optional. Omit it to allow Whisper to identify the language.
+
+## Response
 
 ```json
 {
   "source_url": "https://www.facebook.com/reel/...",
-  "language": "en",
-  "transcript": "The complete transcript...",
-  "segments": [
-    {"start": 0.0, "end": 3.2, "text": "The opening sentence."}
-  ],
-  "method": "whisper"
+  "transcript": "The recognized words...",
+  "vtt": "WEBVTT...",
+  "word_count": 42,
+  "words": [],
+  "method": "facebook_public_video_to_cloudflare_whisper"
 }
 ```
 
-Health check: `GET /health`.
+## Connect to a Custom GPT
 
-## Configuration
+1. Open the GPT editor and add an Action.
+2. Import this schema URL:
+   `https://facebook-transcript-extractor.griffinobungah189.workers.dev/openapi.json`
+3. Configure authentication as **API Key → Bearer**.
+4. Paste the same secret value configured as `API_KEY` in Cloudflare.
+5. Save and test the Action before sharing the GPT.
 
-- `API_KEY`: optional locally; strongly recommended in production.
-- `PUBLIC_BASE_URL`: public HTTPS URL used in the generated OpenAPI schema.
-- `WHISPER_MODEL`: default `small`; `tiny` uses fewer resources, `medium` may improve accuracy.
-- `WHISPER_DEVICE`: default `cpu`.
-- `WHISPER_COMPUTE_TYPE`: default `int8`.
-- `MAX_VIDEO_SECONDS`: default `3600`.
-- `MCP_HOST`, `MCP_PORT`: optional MCP listener, defaults `0.0.0.0` and `8001`.
+The GPT can then call `transcribeFacebookVideo` when someone provides a public Facebook video or Reel URL.
+
+## Processing limits
+
+- Video input is limited to 100 MB.
+- Audio output is limited to 25 MB.
+- Media extraction is capped at 10 minutes per video.
+- Cloudflare Workers Free includes 100,000 requests per day.
+- Workers AI currently includes 10,000 Neurons per day. The Whisper model uses approximately 41.14 Neurons per audio minute, so the theoretical allowance is about 243 audio minutes per day across the account, shared with other Workers AI use.
+- Cloudflare currently documents the Media Transformations Worker binding as open beta, with binding operations not billed during the beta. Check current pricing before relying on this for a public service.
+
+Free allocations are shared at account level and can be exhausted. If they are reached, new transcription requests may fail until the daily reset.
+
+## Local Python implementation
+
+The original FastAPI implementation remains in `app.py`. It uses `yt-dlp` and `faster-whisper` and is intended for local or separately hosted use. It is not used by the deployed Cloudflare Worker.
+
+## Repository
+
+https://github.com/sirbane/facebook-transcript-extractor
 
 ## License
 

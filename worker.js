@@ -51,12 +51,8 @@ function findVideoCandidates(html) {
     const match = tag.match(/content=["']([^"']+)["']/i);
     if (match) values.push(decodeCandidate(match[1]));
   }
-
   const playablePattern = /"(?:playable_url_quality_hd|playable_url|browser_native_hd_url)"\s*:\s*"([^"]+)"/gi;
-  for (const match of html.matchAll(playablePattern)) {
-    values.push(decodeCandidate(match[1]));
-  }
-
+  for (const match of html.matchAll(playablePattern)) values.push(decodeCandidate(match[1]));
   return [...new Set(values)].map(value => {
     try { return new URL(value, "https://www.facebook.com").toString(); }
     catch { return null; }
@@ -71,13 +67,10 @@ async function resolveFacebookVideo(rawUrl) {
       "accept": "text/html,application/xhtml+xml"
     }
   });
-  if (!page.ok) {
-    throw new Error("Facebook did not provide a publicly accessible page (HTTP " + page.status + ").");
-  }
+  if (!page.ok) throw new Error("Facebook did not provide a publicly accessible page (HTTP " + page.status + ").");
   if (!isFacebookHost(new URL(page.url).hostname.toLowerCase())) {
     throw new Error("Facebook redirected the link to an unsupported host.");
   }
-
   const html = await page.text();
   const candidate = findVideoCandidates(html).find(value => {
     try {
@@ -86,7 +79,6 @@ async function resolveFacebookVideo(rawUrl) {
         !u.hostname.endsWith(".facebook.com") && !u.pathname.includes("/video/embed");
     } catch { return false; }
   });
-
   if (!candidate) {
     throw new Error("Could not find a direct video stream in Facebook's public page. The video may require login, have restricted visibility, or Facebook may have changed its page format.");
   }
@@ -99,32 +91,24 @@ async function transcribeFacebook(rawUrl, env, language) {
     redirect: "follow",
     headers: { "user-agent": "Mozilla/5.0" }
   });
-  if (!video.ok) {
-    throw new Error("The public video stream could not be downloaded (HTTP " + video.status + ").");
-  }
+  if (!video.ok) throw new Error("The public video stream could not be downloaded (HTTP " + video.status + ").");
   if (!isFacebookHost(new URL(video.url).hostname.toLowerCase())) {
     throw new Error("The video stream redirected to an unsupported host.");
   }
-
   const declaredSize = Number(video.headers.get("content-length") || 0);
-  if (declaredSize > MAX_VIDEO_BYTES) {
-    throw new Error("Video exceeds the 100 MB processing limit.");
-  }
+  if (declaredSize > MAX_VIDEO_BYTES) throw new Error("Video exceeds the 100 MB processing limit.");
   if (!video.body) throw new Error("Facebook returned an empty video stream.");
 
   const extracted = await env.MEDIA.input(video.body)
     .transform()
     .output({ mode: "audio", duration: "10m" })
     .response();
+  if (!extracted.ok || !extracted.body) throw new Error("Cloudflare could not extract audio from this video.");
 
-  if (!extracted.ok || !extracted.body) {
-    throw new Error("Cloudflare could not extract audio from this video.");
-  }
   const audioBytes = await extracted.arrayBuffer();
   if (audioBytes.byteLength > MAX_AUDIO_BYTES) {
     throw new Error("Extracted audio exceeds the 25 MB transcription limit.");
   }
-
   const input = { audio: Array.from(new Uint8Array(audioBytes)) };
   if (language) input.source_lang = language;
   const result = await env.AI.run(MODEL, input);
@@ -148,6 +132,11 @@ function openApi(origin) {
       description: "Transcribe publicly accessible Facebook videos and Reels. Does not bypass login, privacy controls, DRM, or access restrictions."
     },
     servers: [{ url: origin }],
+    components: {
+      securitySchemes: {
+        bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "API key" }
+      }
+    },
     paths: {
       "/health": {
         get: {
@@ -160,6 +149,7 @@ function openApi(origin) {
         post: {
           operationId: "transcribeFacebookVideo",
           summary: "Transcribe a public Facebook video or Reel",
+          security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
             content: {
@@ -178,8 +168,10 @@ function openApi(origin) {
           responses: {
             "200": { description: "Transcript and word timestamps" },
             "400": { description: "Invalid request" },
+            "401": { description: "Missing or invalid bearer API key" },
             "422": { description: "Video is not publicly accessible or extraction failed" },
-            "500": { description: "Transcription service error" }
+            "500": { description: "Transcription service error" },
+            "503": { description: "API_KEY secret has not been configured" }
           }
         }
       }
@@ -212,11 +204,16 @@ export default {
     if (url.pathname !== "/transcribe" || request.method !== "POST") {
       return json({ error: "Not found" }, 404, origin);
     }
+    if (!env.API_KEY) {
+      return json({ error: "Service setup incomplete: configure the API_KEY secret in Cloudflare before using transcription." }, 503, origin);
+    }
+    if (request.headers.get("authorization") !== "Bearer " + env.API_KEY) {
+      return json({ error: "A valid bearer API key is required." }, 401, origin);
+    }
 
     let body;
     try { body = await request.json(); }
     catch { return json({ error: "Request body must be valid JSON." }, 400, origin); }
-
     if (!body || typeof body.facebook_url !== "string") {
       return json({ error: "facebook_url is required." }, 400, origin);
     }

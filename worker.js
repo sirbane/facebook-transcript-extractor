@@ -179,6 +179,67 @@ function openApi(origin) {
   };
 }
 
+
+async function handleMcp(request, env) {
+  const headers = { "content-type": "application/json", "cache-control": "no-store", "Mcp-Protocol-Version": "2025-03-26" };
+  const reply = (id, result) => new Response(JSON.stringify({ jsonrpc: "2.0", id, result }), { status: 200, headers });
+  const fail = (id, code, message) => new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }), { status: 200, headers });
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
+  if (!env.API_KEY) return new Response("Server authentication is not configured.", { status: 503 });
+  if (request.headers.get("authorization") !== "Bearer " + env.API_KEY) {
+    return new Response("Unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
+  }
+  let message;
+  try { message = await request.json(); }
+  catch { return fail(null, -32700, "Parse error"); }
+  if (!message || message.jsonrpc !== "2.0" || typeof message.method !== "string") return fail(message?.id ?? null, -32600, "Invalid Request");
+  const id = message.id;
+  if (message.method === "notifications/initialized" || message.method === "notifications/cancelled") {
+    return new Response(null, { status: 202, headers });
+  }
+  if (message.method === "initialize") {
+    const requested = message.params?.protocolVersion;
+    const supported = ["2025-03-26", "2024-11-05"];
+    return reply(id, {
+      protocolVersion: supported.includes(requested) ? requested : "2025-03-26",
+      capabilities: { tools: {} },
+      serverInfo: { name: "facebook-transcript-extractor", version: "2.1.0" },
+      instructions: "Transcribe only publicly accessible Facebook videos and Reels. Never claim to bypass login, privacy restrictions, DRM, or access controls."
+    });
+  }
+  if (message.method === "ping") return reply(id, {});
+  if (message.method === "tools/list") {
+    return reply(id, { tools: [{
+      name: "transcribe_facebook_video",
+      title: "Transcribe Facebook video",
+      description: "Extract a transcript and word timestamps from a publicly accessible Facebook video or Reel. Requires a public Facebook URL. Does not bypass login, privacy controls, DRM, or access restrictions.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["facebook_url"],
+        properties: {
+          facebook_url: { type: "string", format: "uri", description: "Public Facebook video, Reel, or fb.watch URL." },
+          language: { type: "string", description: "Optional source language code, such as en." }
+        }
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+    }] });
+  }
+  if (message.method === "tools/call") {
+    const args = message.params?.arguments || {};
+    if (message.params?.name !== "transcribe_facebook_video") return fail(id, -32602, "Unknown tool");
+    if (typeof args.facebook_url !== "string" || !args.facebook_url.trim()) return reply(id, { isError: true, content: [{ type: "text", text: "facebook_url is required." }] });
+    try {
+      const result = await transcribeFacebook(args.facebook_url, env, args.language || null);
+      return reply(id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false });
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : "Unexpected transcription error.";
+      return reply(id, { content: [{ type: "text", text: messageText }], isError: true });
+    }
+  }
+  return fail(id, -32601, "Method not found");
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get("origin") || "*";
@@ -195,6 +256,7 @@ export default {
     }
 
     const url = new URL(request.url);
+    if (url.pathname === "/mcp") return handleMcp(request, env);
     if (url.pathname === "/health" && request.method === "GET") {
       return json({ status: "ok", service: "facebook-transcript-extractor", model: MODEL }, 200, origin);
     }

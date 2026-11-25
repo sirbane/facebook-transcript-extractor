@@ -1,7 +1,7 @@
 const MODEL = "@cf/openai/whisper";
 const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-const ALLOWED_PAGE_HOSTS = new Set([
+const PAGE_HOSTS = new Set([
   "facebook.com", "www.facebook.com", "m.facebook.com",
   "web.facebook.com", "fb.watch"
 ]);
@@ -20,15 +20,12 @@ function json(data, status = 200, origin = "*") {
 }
 
 function isFacebookHost(host) {
-  return ALLOWED_PAGE_HOSTS.has(host) ||
-    host.endsWith(".fbcdn.net") ||
-    host.endsWith(".fbsbx.com") ||
-    host.endsWith(".facebook.com");
+  return PAGE_HOSTS.has(host) || host.endsWith(".fbcdn.net") ||
+    host.endsWith(".fbsbx.com") || host.endsWith(".facebook.com");
 }
 
 function decodeCandidate(value) {
-  return value
-    .replace(/&amp;/g, "&")
+  return value.replace(/&amp;/g, "&")
     .replace(/\\u0025/gi, "%")
     .replace(/\\u0026/gi, "&")
     .replace(/\\u003d/gi, "=")
@@ -37,10 +34,11 @@ function decodeCandidate(value) {
     .replace(/&#x27;/g, "'");
 }
 
-function validateFacebookPage(raw) {
+function validatePageUrl(raw) {
   let url;
-  try { url = new URL(raw); } catch { throw new Error("Provide a valid Facebook video or Reel URL."); }
-  if (url.protocol !== "https:" || !ALLOWED_PAGE_HOSTS.has(url.hostname.toLowerCase())) {
+  try { url = new URL(raw); }
+  catch { throw new Error("Provide a valid Facebook video or Reel URL."); }
+  if (url.protocol !== "https:" || !PAGE_HOSTS.has(url.hostname.toLowerCase())) {
     throw new Error("Only public Facebook video, Reel, and fb.watch links are supported.");
   }
   return url;
@@ -48,46 +46,47 @@ function validateFacebookPage(raw) {
 
 function findVideoCandidates(html) {
   const values = [];
-  const meta = /<meta\\b[^>]*(?:property|name)=["'](?:og:video(?::secure_url|:url)?|twitter:player:stream)["'][^>]*>/gi;
-  for (const tag of html.match(meta) || []) {
+  const metaPattern = /<meta\b[^>]*(?:property|name)=["'](?:og:video(?::secure_url|:url)?|twitter:player:stream)["'][^>]*>/gi;
+  for (const tag of html.match(metaPattern) || []) {
     const match = tag.match(/content=["']([^"']+)["']/i);
     if (match) values.push(decodeCandidate(match[1]));
   }
-  const patterns = [
-    /"(?:playable_url_quality_hd|playable_url|browser_native_hd_url)"\\s*:\\s*"((?:https?:)?[^"]+)"/gi,
-    /"src"\\s*:\\s*"(https?:\\\\?\\/\\\\?\/[^"]+\\.(?:mp4|m4a)[^"]*)"/gi
-  ];
-  for (const pattern of patterns) {
-    for (const match of html.matchAll(pattern)) values.push(decodeCandidate(match[1]));
+
+  const playablePattern = /"(?:playable_url_quality_hd|playable_url|browser_native_hd_url)"\s*:\s*"([^"]+)"/gi;
+  for (const match of html.matchAll(playablePattern)) {
+    values.push(decodeCandidate(match[1]));
   }
+
   return [...new Set(values)].map(value => {
-    try { return new URL(value, "https://www.facebook.com").toString(); } catch { return null; }
+    try { return new URL(value, "https://www.facebook.com").toString(); }
+    catch { return null; }
   }).filter(Boolean);
 }
 
 async function resolveFacebookVideo(rawUrl) {
-  const pageUrl = validateFacebookPage(rawUrl);
-  const page = await fetch(pageUrl.toString(), {
+  const page = await fetch(validatePageUrl(rawUrl).toString(), {
     redirect: "follow",
     headers: {
       "user-agent": "Mozilla/5.0 (compatible; FacebookTranscriptExtractor/1.0)",
       "accept": "text/html,application/xhtml+xml"
     }
   });
-  if (!page.ok) throw new Error("Facebook did not provide a publicly accessible page (HTTP " + page.status + ").");
-  const finalPageUrl = new URL(page.url);
-  if (!isFacebookHost(finalPageUrl.hostname.toLowerCase())) {
+  if (!page.ok) {
+    throw new Error("Facebook did not provide a publicly accessible page (HTTP " + page.status + ").");
+  }
+  if (!isFacebookHost(new URL(page.url).hostname.toLowerCase())) {
     throw new Error("Facebook redirected the link to an unsupported host.");
   }
+
   const html = await page.text();
   const candidate = findVideoCandidates(html).find(value => {
     try {
       const u = new URL(value);
       return u.protocol === "https:" && isFacebookHost(u.hostname.toLowerCase()) &&
-        !u.hostname.endsWith(".facebook.com") &&
-        !u.pathname.includes("/video/embed");
+        !u.hostname.endsWith(".facebook.com") && !u.pathname.includes("/video/embed");
     } catch { return false; }
   });
+
   if (!candidate) {
     throw new Error("Could not find a direct video stream in Facebook's public page. The video may require login, have restricted visibility, or Facebook may have changed its page format.");
   }
@@ -100,30 +99,36 @@ async function transcribeFacebook(rawUrl, env, language) {
     redirect: "follow",
     headers: { "user-agent": "Mozilla/5.0" }
   });
-  if (!video.ok) throw new Error("The public video stream could not be downloaded (HTTP " + video.status + ").");
-  const finalMediaUrl = new URL(video.url);
-  if (!isFacebookHost(finalMediaUrl.hostname.toLowerCase())) {
+  if (!video.ok) {
+    throw new Error("The public video stream could not be downloaded (HTTP " + video.status + ").");
+  }
+  if (!isFacebookHost(new URL(video.url).hostname.toLowerCase())) {
     throw new Error("The video stream redirected to an unsupported host.");
   }
+
   const declaredSize = Number(video.headers.get("content-length") || 0);
-  if (declaredSize > MAX_VIDEO_BYTES) throw new Error("Video exceeds the 100 MB processing limit.");
-  const videoBytes = await video.arrayBuffer();
-  if (videoBytes.byteLength > MAX_VIDEO_BYTES) throw new Error("Video exceeds the 100 MB processing limit.");
+  if (declaredSize > MAX_VIDEO_BYTES) {
+    throw new Error("Video exceeds the 100 MB processing limit.");
+  }
+  if (!video.body) throw new Error("Facebook returned an empty video stream.");
 
-  const mediaResponse = await env.MEDIA.input(new ReadableStream({
-    start(controller) {
-      controller.enqueue(new Uint8Array(videoBytes));
-      controller.close();
-    }
-  })).transform().output({ mode: "audio", duration: "10m" }).response();
+  const extracted = await env.MEDIA.input(video.body)
+    .transform()
+    .output({ mode: "audio", duration: "10m" })
+    .response();
 
-  if (!mediaResponse.ok) throw new Error("Cloudflare could not extract audio from this video.");
-  const audioBytes = await mediaResponse.arrayBuffer();
-  if (audioBytes.byteLength > MAX_AUDIO_BYTES) throw new Error("Extracted audio exceeds the 25 MB transcription limit.");
+  if (!extracted.ok || !extracted.body) {
+    throw new Error("Cloudflare could not extract audio from this video.");
+  }
+  const audioBytes = await extracted.arrayBuffer();
+  if (audioBytes.byteLength > MAX_AUDIO_BYTES) {
+    throw new Error("Extracted audio exceeds the 25 MB transcription limit.");
+  }
 
-  const options = { audio: Array.from(new Uint8Array(audioBytes)) };
-  if (language) options.source_lang = language;
-  const result = await env.AI.run(MODEL, options);
+  const input = { audio: Array.from(new Uint8Array(audioBytes)) };
+  if (language) input.source_lang = language;
+  const result = await env.AI.run(MODEL, input);
+
   return {
     source_url: rawUrl,
     transcript: result.text || "",
@@ -144,7 +149,13 @@ function openApi(origin) {
     },
     servers: [{ url: origin }],
     paths: {
-      "/health": { get: { operationId: "healthCheck", summary: "Check service status", responses: { "200": { description: "Service is online" } } } },
+      "/health": {
+        get: {
+          operationId: "healthCheck",
+          summary: "Check service status",
+          responses: { "200": { description: "Service is online" } }
+        }
+      },
       "/transcribe": {
         post: {
           operationId: "transcribeFacebookVideo",
